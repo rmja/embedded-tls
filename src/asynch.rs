@@ -1,4 +1,5 @@
 use crate::alert::*;
+use crate::buffer::CryptoBuffer;
 use crate::connection::*;
 use crate::handshake::ServerHandshake;
 use crate::key_schedule::KeySchedule;
@@ -6,7 +7,7 @@ use crate::record::{ClientRecord, ServerRecord};
 use crate::TlsError;
 use embedded_io::Error as _;
 use embedded_io::{
-    asynch::{Read as AsyncRead, Write as AsyncWrite},
+    asynch::{Read as AsyncRead, Write as AsyncWrite, DirectRead, DirectReadHandle},
     Io,
 };
 use rand_core::{CryptoRng, RngCore};
@@ -31,6 +32,11 @@ where
     key_schedule: KeySchedule<CipherSuite::Hash, CipherSuite::KeyLen, CipherSuite::IvLen>,
     record_buf: &'a mut [u8],
     opened: bool,
+}
+
+pub struct TlsReadHandle<'b> {
+    buffer: CryptoBuffer<'b>,
+    is_completed: bool,
 }
 
 impl<'a, Socket, CipherSuite> TlsConnection<'a, Socket, CipherSuite>
@@ -128,53 +134,47 @@ where
     /// Read and decrypt data filling the provided slice. The slice must be able to
     /// keep the expected amount of data that can be received in one record to avoid
     /// loosing data.
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
+    pub async fn read<'b>(&'b mut self) -> Result<TlsReadHandle<'b>, TlsError> {
         if self.opened {
-            let mut remaining = buf.len();
-            // Note: Read only a single ApplicationData record for now, as we don't do any buffering.
-            while remaining == buf.len() {
-                let socket = &mut self.delegate;
-                let key_schedule = &mut self.key_schedule;
-                let record =
-                    decode_record::<Socket, CipherSuite>(socket, self.record_buf, key_schedule)
-                        .await?;
-                let mut records = Queue::new();
-                decrypt_record::<CipherSuite>(key_schedule, &mut records, record)?;
-                while let Some(record) = records.dequeue() {
-                    match record {
-                        ServerRecord::ApplicationData(ApplicationData { header: _, data }) => {
-                            trace!("Got application data record");
-                            if buf.len() < data.len() {
-                                warn!("Passed buffer is too small");
-                                Err(TlsError::EncodeError)
-                            } else {
-                                let to_copy = core::cmp::min(data.len(), buf.len());
-                                // TODO Need to buffer data not consumed
-                                trace!("Got {} bytes to copy", to_copy);
-                                buf[..to_copy].copy_from_slice(&data.as_slice()[..to_copy]);
-                                remaining -= to_copy;
-                                Ok(())
-                            }
+            let socket = &mut self.delegate;
+            let key_schedule = &mut self.key_schedule;
+            let record =
+                decode_record::<Socket, CipherSuite>(socket, self.record_buf, key_schedule).await?;
+            let mut records = Queue::new();
+            decrypt_record::<CipherSuite>(key_schedule, &mut records, record)?;
+
+            let mut handle = None;
+            while let Some(record) = records.dequeue() {
+                if let Some(buffer) = match record {
+                    ServerRecord::ApplicationData(ApplicationData { header: _, data }) => {
+                        Ok(Some(data))
+                    }
+                    ServerRecord::Alert(alert) => {
+                        if let AlertDescription::CloseNotify = alert.description {
+                            Err(TlsError::ConnectionClosed)
+                        } else {
+                            Err(TlsError::InternalError)
                         }
-                        ServerRecord::Alert(alert) => {
-                            if let AlertDescription::CloseNotify = alert.description {
-                                Err(TlsError::ConnectionClosed)
-                            } else {
-                                Err(TlsError::InternalError)
-                            }
-                        }
-                        ServerRecord::ChangeCipherSpec(_) => Err(TlsError::InternalError),
-                        ServerRecord::Handshake(ServerHandshake::NewSessionTicket(_)) => {
-                            // Ignore
-                            Ok(())
-                        }
-                        _ => {
-                            unimplemented!()
-                        }
-                    }?;
+                    }
+                    ServerRecord::ChangeCipherSpec(_) => Err(TlsError::InternalError),
+                    ServerRecord::Handshake(ServerHandshake::NewSessionTicket(_)) => {
+                        // Ignore
+                        Ok(None)
+                    }
+                    _ => {
+                        unimplemented!()
+                    }
+                }? {
+                    handle = Some(TlsReadHandle {
+                        buffer,
+                        is_completed: false,
+                    })
                 }
             }
-            Ok(buf.len() - remaining)
+            Ok(handle.unwrap_or_else(|| TlsReadHandle {
+                buffer: CryptoBuffer::empty(),
+                is_completed: true,
+            }))
         } else {
             Err(TlsError::MissingHandshake)
         }
@@ -220,13 +220,25 @@ where
     type Error = TlsError;
 }
 
-impl<'a, Socket, CipherSuite> AsyncRead for TlsConnection<'a, Socket, CipherSuite>
+impl<'m> DirectReadHandle<'m> for TlsReadHandle<'m> {
+    fn as_slice(&self) -> &[u8] {
+        self.buffer.as_slice()
+    }
+
+    fn is_completed(&self) -> bool {
+        self.is_completed
+    }
+}
+
+impl<'a, Socket, CipherSuite> DirectRead for TlsConnection<'a, Socket, CipherSuite>
 where
     Socket: AsyncRead + AsyncWrite + 'a,
     CipherSuite: TlsCipherSuite + 'static,
 {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        TlsConnection::read(self, buf).await
+    type Handle<'m> = TlsReadHandle<'m>;
+
+    async fn read<'m>(&'m mut self) -> Result<Self::Handle<'m>, Self::Error> {
+        TlsConnection::read(self).await
     }
 }
 
