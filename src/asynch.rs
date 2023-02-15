@@ -242,6 +242,31 @@ where
     }
 }
 
+impl<'a, Socket, CipherSuite> AsyncRead for TlsConnection<'a, Socket, CipherSuite>
+where
+    Socket: AsyncRead + AsyncWrite + 'a,
+    CipherSuite: TlsCipherSuite + 'static,
+{
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        loop {
+            let handle = self.read().await?;
+
+            // We cannot return empty slices as that would signify completion.
+            let slice = handle.as_slice();
+            if !slice.is_empty() || handle.is_completed() {
+                if buf.len() >= slice.len() {
+                    let len = core::cmp::min(slice.len(), buf.len());
+                    buf[..len].copy_from_slice(&slice[..len]);
+                    return Ok(len);
+                } else {
+                    warn!("Passed buffer is too small");
+                    return Err(TlsError::EncodeError);
+                }
+            }
+        }
+    }
+}
+
 impl<'a, Socket, CipherSuite> AsyncWrite for TlsConnection<'a, Socket, CipherSuite>
 where
     Socket: AsyncRead + AsyncWrite + 'a,
